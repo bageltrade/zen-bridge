@@ -486,9 +486,15 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && (path === "/health" || path === "/")) {
       let oc = false
       try { await ocFetch("/global/health"); oc = true } catch {}
+      // In direct mode OpenCode is intentionally absent, so its absence is not
+      // a failure: the direct models are still fully usable.
+      const directOk = CFG.directModels.size > 0
       res.writeHead(200, { "content-type": "application/json" })
       return res.end(JSON.stringify({
-        ok: oc, opencode: CFG.opencodeUrl, opencodeReachable: oc,
+        ok: directOk || oc,
+        mode: directOk && !oc ? "direct" : "full",
+        opencode: CFG.opencodeUrl, opencodeReachable: oc,
+        directModels: [...CFG.directModels],
         model: CFG.model, directory: CFG.directory, sessions: sessions.size,
       }))
     }

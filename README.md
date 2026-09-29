@@ -87,9 +87,9 @@ the middle. See [Limitations](#limitations).
 
 ## Setup
 
-> **On Android/Termux?** Read [TERMUX.md](TERMUX.md) first — OpenCode's official
-> binary is a glibc build that will not run on bionic, and `npm i -g opencode-ai`
-> is blocked by npm. There is a working community build; the guide has it.
+> **On Android/Termux?** Read [TERMUX.md](TERMUX.md). For tool calling you do
+> **not** need OpenCode at all — `./start.sh --direct` runs the bridge alone,
+> which is both simpler and more reliable than any OpenCode build on bionic.
 
 ```bash
 cd zen-bridge
@@ -99,6 +99,9 @@ $EDITOR zen-bridge.env
 ```
 
 `start.sh` launches `opencode serve` + the bridge and prints client config.
+
+If you only want `space-bunny-free` (the model with working tool calling), run
+`./start.sh --direct` instead — no OpenCode required.
 
 ### Point your agent at it
 
