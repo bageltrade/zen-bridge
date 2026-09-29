@@ -1,0 +1,11 @@
+# never commit real credentials
+zen-bridge.env
+.env
+
+# runtime logs
+*.log
+opencode-serve.log
+
+# local scratch
+.DS_Store
+node_modules/
