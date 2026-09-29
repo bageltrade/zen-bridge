@@ -49,7 +49,14 @@ else
   echo "    (space-bunny-free works keyless; the other free models need a key)"
 fi
 
+# Critical: opencode must not act on its own tools here, or a single turn can
+# turn into an agent loop that edits files. This is the only mechanism verified
+# to zero the tool list -- the per-message `tools` map and the session-level
+# `permission` field are both ignored by opencode 1.18.x.
+export OPENCODE_CONFIG_CONTENT="${OPENCODE_CONFIG_CONTENT:-{\"permission\":{\"*\":\"deny\"}}}"
+
 echo "==> starting $OPENCODE_BIN serve on ${OPENCODE_URL} (dir=${OPENCODE_DIR})"
+echo "    tools disabled via OPENCODE_CONFIG_CONTENT permission deny"
 "$OPENCODE_BIN" serve --port "$OPENCODE_PORT" --hostname "$OPENCODE_HOST" --pure \
   >"${HERE}/opencode-serve.log" 2>&1 &
 OC_PID=$!

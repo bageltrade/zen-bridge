@@ -150,32 +150,75 @@ the loophole further, not a bridge bug; the error message will say so verbatim.
 
 ---
 
+## Tool calling
+
+This is the one place the two paths differ sharply, so the bridge picks a path
+per model.
+
+| | direct path | OpenCode path |
+|---|---|---|
+| applies to | `space-bunny-free` | gated models (`big-pickle`, `mimo-*`, …) |
+| tool calling | ✅ full, both wire formats | ❌ not possible |
+| system prompt | yours only | OpenCode's + yours |
+| speed | one hop | one extra local hop |
+
+A model in `DIRECT_MODELS` is forwarded to Zen **verbatim**, so `tools`,
+`tool_choice`, `response_format` and every other field survive untouched.
+
+For gated models the request has to pass through the OpenCode binary, and
+OpenCode runs its own tool loop — it cannot emit *your* function names. Rather
+than let the model quietly improvise, the bridge rejects the request:
+
+```
+HTTP 400  tool calling is not available for 'big-pickle' because it is served
+through OpenCode, which owns its own tool loop. Use a direct model
+(space-bunny-free), or call Zen directly at https://opencode.ai/zen/v1.
+```
+
+That guard is not theoretical. Before it existed, `big-pickle`-shaped requests
+came back `finish_reason: "stop"` with **invented** data — the model claimed "no
+`get_weather` tool exists in this session" and made up the weather. In a coding
+agent that failure mode is worse than an error.
+
+Verified against live Zen through the bridge:
+
+- OpenAI tools → `finish_reason: "tool_calls"`, correct arguments
+- Anthropic tools → `stop_reason: "tool_use"`, correct `input`
+- streaming tools → `tool_calls` deltas, clean `[DONE]`
+- full round trip (call, feed result back) → coherent final answer
+
 ## Limitations
 
-- **OpenCode is an agent server, not a raw completion API.** The bridge disables
-  OpenCode's tools (`bash`, `edit`, `write`, …) so it won't touch your files, but
-  OpenCode still prepends its own system prompt. Your agent's system prompt is
-  passed through *in addition to* it, not instead of it.
-- **No tool-calling passthrough.** Because OpenCode's tools are off, the model
-  answers in prose. If your agent needs to call functions, drive it through
-  OpenCode itself, or use `space-bunny-free` directly (see below).
-- **One session per conversation.** The bridge keys an OpenCode session on the
-  opening user message and appends only new turns, because OpenCode already holds
-  the assistant turns it generated. Editing earlier history mid-conversation
-  starts a fresh session.
-- **Latency.** Every streaming turn waits ~150 ms to attach to the event bus
-  before dispatching, so no early tokens are lost.
+- **OpenCode's tools must be disabled, and only the config can do it.** The
+  per-message `tools` map and the session-level `permission` field are both
+  ignored by OpenCode 1.18.x — with tools live, a single turn becomes an agent
+  loop that can edit your files. `start.sh` therefore launches OpenCode with
+  `OPENCODE_CONFIG_CONTENT='{"permission":{"*":"deny"}}'`, which is verified to
+  put **zero** tools on the wire. If you launch `opencode serve` yourself, you
+  must do this yourself or run in a scratch directory. `run-tests.sh` asserts
+  the tool count is 0 so this cannot regress silently.
+- **OpenCode still injects its own system prompt** on the OpenCode path. Your
+  agent's prompt is passed *in addition to* it, not instead of it. The direct
+  path has no such contamination.
+- **One session per conversation** on the OpenCode path. The bridge keys a
+  session on the opening user message and appends only new turns. Editing
+  earlier history mid-conversation starts a fresh session.
+- **Latency.** Every streaming turn on the OpenCode path waits ~150 ms to attach
+  to the event bus before dispatching, so no early tokens are lost.
 
 ## When you don't need this at all
 
-If `space-bunny-free` is the model you want, skip the bridge — it is anonymous
-and needs no key:
+If `space-bunny-free` is the model you want, skip the bridge — it is anonymous,
+needs no key, and already does tool calling on its own:
 
 ```json
 { "baseURL": "https://opencode.ai/zen/v1", "apiKey": "" }
 ```
 
-The bridge is only worth it for the models Zen gates.
+(That is exactly what the bridge's direct path does anyway, so you lose nothing
+but the convenience of one config.)
+
+The bridge earns its keep for the models Zen gates.
 
 ---
 
@@ -190,6 +233,9 @@ The bridge is only worth it for the models Zen gates.
 | `OPENCODE_DIR` | `$PWD` | project root OpenCode treats as cwd |
 | `OPENCODE_AGENT` | `build` | OpenCode agent used for the turn |
 | `OPENCODE_BIN` | `opencode` | binary name — set to `opencode-termux` on Termux |
+| `DIRECT_MODELS` | `space-bunny-free` | comma-separated models forwarded straight to Zen; set to `""` to route everything through OpenCode |
+| `ZEN_BASE` | `https://opencode.ai/zen/v1` | upstream for the direct path |
+| `ZEN_API_KEY` | — | optional credential for the direct path; leave unset for anonymous models, since a bad key is worse than none |
 | `BRIDGE_TIMEOUT_MS` | `600000` | per-turn timeout |
 
 ## Tests

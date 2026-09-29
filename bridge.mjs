@@ -27,6 +27,19 @@ const CFG = {
   provider: process.env.OPENCODE_PROVIDER || "opencode",
   agent: process.env.OPENCODE_AGENT || "build",
   requestTimeoutMs: Number(process.env.BRIDGE_TIMEOUT_MS || 600000),
+  zenBase: (process.env.ZEN_BASE || "https://opencode.ai/zen/v1").replace(/\/$/, ""),
+  // Optional credential for the direct path. Leave unset for anonymous models —
+  // sending a bad key to Zen is worse than sending none.
+  zenApiKey: process.env.ZEN_API_KEY || "",
+  // Models Zen serves to anyone. These skip OpenCode entirely: the gateway
+  // already accepts them, and going direct is the only way to keep tool
+  // calling, since OpenCode owns its own tool loop.
+  // Note: an explicitly empty DIRECT_MODELS="" must mean "route everything
+  // through OpenCode", so test for presence rather than truthiness.
+  directModels: new Set(
+    (process.env.DIRECT_MODELS === undefined ? "space-bunny-free" : process.env.DIRECT_MODELS)
+      .split(",").map((m) => m.trim()).filter(Boolean)
+  ),
 }
 
 const KNOWN_FREE_MODELS = [
@@ -84,17 +97,24 @@ function textOf(content) {
   return ""
 }
 
+// Every tool id opencode registers, from packages/opencode/src/tool/registry.ts.
+// NOTE: opencode 1.18.x does not honour this map on the message body -- the
+// mechanism that actually works is the deny-all permission in the opencode
+// config, which start.sh sets via OPENCODE_CONFIG_CONTENT. This map is kept as
+// a second line of defence for opencode versions that do honour it.
+const ALL_TOOLS = [
+  "invalid", "shell", "read", "glob", "grep", "edit", "write", "task",
+  "fetch", "todo", "search", "skill", "patch", "question", "lsp",
+]
+const NO_TOOLS = Object.fromEntries(ALL_TOOLS.map((t) => [t, false]))
+
 // opencode injects its own agent prompt; this body disables its tools so the
 // session behaves like a plain completion instead of an autonomous agent.
 function messageBody(text, extra = {}) {
   return {
     parts: [{ type: "text", text }],
     agent: CFG.agent,
-    tools: {
-      bash: false, edit: false, write: false, read: false, patch: false,
-      grep: false, glob: false, list: false, webfetch: false, task: false,
-      todowrite: false, todoread: false, invalid: false,
-    },
+    tools: { ...NO_TOOLS },
     ...extra,
   }
 }
@@ -105,6 +125,59 @@ async function sendMessage(sessionID, text, extra) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(messageBody(text, extra)),
   })
+}
+
+// ---------------------------------------------------------------- direct path
+
+/**
+ * For models Zen serves anonymously, forward the request verbatim. This keeps
+ * tools, tool_choice, response_format, sampling params and every other field
+ * intact — none of which survive the OpenCode hop, because OpenCode runs its own
+ * tool loop and cannot emit the caller's function names.
+ */
+async function directPass(req, res, body, zenPath) {
+  const headers = { "content-type": "application/json" }
+  if (CFG.zenApiKey) headers.authorization = `Bearer ${CFG.zenApiKey}`
+  if (req.headers["anthropic-version"]) headers["anthropic-version"] = req.headers["anthropic-version"]
+  if (body.stream) headers.accept = "text/event-stream"
+
+  const upstream = await fetch(`${CFG.zenBase}${zenPath}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  })
+
+  res.writeHead(upstream.status, {
+    "content-type": upstream.headers.get("content-type") || "application/json",
+    "cache-control": "no-cache, no-transform",
+    ...(upstream.headers.get("content-type") || "").includes("event-stream")
+      ? { connection: "keep-alive", "x-accel-buffering": "no" }
+      : {},
+  })
+
+  if (!upstream.body) return res.end()
+  const reader = upstream.body.getReader()
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      res.write(Buffer.from(value))
+    }
+  } catch (e) {
+    log("direct stream aborted:", e.message)
+  }
+  res.end()
+}
+
+/** Tools cannot survive the OpenCode hop; fail loudly instead of letting the
+ *  model invent an answer. */
+function assertNoTools(body, model) {
+  if (Array.isArray(body.tools) && body.tools.length) {
+    throw new HttpError(400,
+      `bridge: tool calling is not available for '${model}' because it is served through ` +
+      `OpenCode, which owns its own tool loop. Use a direct model (${[...CFG.directModels].join(", ")}), ` +
+      `or call Zen directly at ${CFG.zenBase}.`)
+  }
 }
 
 // ---------------------------------------------------------------- session reuse
@@ -272,8 +345,11 @@ async function handleOpenAI(req, res, body) {
   const messages = Array.isArray(body.messages) ? body.messages : []
   if (!messages.length) throw new HttpError(400, "bridge: 'messages' is required")
   const model = body.model || CFG.model
-  const system = messages.filter((m) => m.role === "system").map((m) => textOf(m.content)).join("\n\n")
 
+  if (CFG.directModels.has(model)) return directPass(req, res, body, "/chat/completions")
+  assertNoTools(body, model)
+
+  const system = messages.filter((m) => m.role === "system").map((m) => textOf(m.content)).join("\n\n")
   const turn = await prepareTurn(model, system, messages)
 
   if (!body.stream) {
@@ -321,6 +397,10 @@ async function handleAnthropic(req, res, body) {
   const messages = Array.isArray(body.messages) ? body.messages : []
   if (!messages.length) throw new HttpError(400, "bridge: 'messages' is required")
   const model = body.model || CFG.model
+
+  if (CFG.directModels.has(model)) return directPass(req, res, body, "/messages")
+  assertNoTools(body, model)
+
   const system = typeof body.system === "string"
     ? body.system
     : Array.isArray(body.system) ? body.system.map(textOf).join("\n\n") : ""
